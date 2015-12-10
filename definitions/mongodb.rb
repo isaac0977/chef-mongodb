@@ -219,7 +219,7 @@ define :mongodb_instance,
       "mongodb_cluster_name:#{new_resource.replicaset['mongodb']['cluster_name']} AND \
        mongodb_is_replicaset:true AND \
        mongodb_shard_name:#{new_resource.replicaset['mongodb']['shard_name']} AND \
-       chef_environment:#{new_resource.replicaset.chef_environment}"
+       chef_environment:#{new_resource.replicaset['mongodb']['restrict_env_string'] ? new_resource.replicaset['mongodb']['restrict_env_string'] : new_resource.replicaset.chef_environment}"
     )
 
     ruby_block 'config_replicaset' do
@@ -244,7 +244,7 @@ define :mongodb_instance,
       :node,
       "mongodb_cluster_name:#{new_resource.cluster_name} AND \
        mongodb_is_shard:true AND \
-       chef_environment:#{node.chef_environment}"
+       chef_environment:#{new_resource.replicaset['mongodb']['restrict_env_string'] ? new_resource.replicaset['mongodb']['restrict_env_string'] : new_resource.replicaset.chef_environment}"
     )
 
     ruby_block 'config_sharding' do
