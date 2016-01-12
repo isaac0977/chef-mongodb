@@ -14,6 +14,7 @@ end
 
 package sasldev_pkg do
   action :nothing
+  ignore_failure true
 end.run_action(:install)
 
 node['mongodb']['ruby_gems'].each do |gem, version|
