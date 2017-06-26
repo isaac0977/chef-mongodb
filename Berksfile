@@ -1,5 +1,5 @@
-source "http://api.berkshelf.com"
+source 'https://supermarket.chef.io'
 
 metadata
 
-cookbook 'chef-solo-search'
+cookbook 'mongodb_spec', path: 'test/fixtures/cookbooks/mongodb_spec'

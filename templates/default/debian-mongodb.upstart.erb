@@ -19,7 +19,20 @@ script
   if [ -f <%= @sysconfig_file %> ]; then
     . <%= @sysconfig_file %>;
   fi
+
+  # Handle NUMA access to CPUs (SERVER-3574)
+  # This verifies the existence of numactl as well as testing that the command works
+  NUMACTL_ARGS="--interleave=all"
+  if which numactl >/dev/null 2>/dev/null && numactl $NUMACTL_ARGS ls / >/dev/null 2>/dev/null
+  then
+      NUMACTL="`which numactl` -- $NUMACTL_ARGS"
+      DAEMON_OPTS="$DAEMON_OPTS"
+  else
+      NUMACTL=""
+      DAEMON_OPTS="-- $DAEMON_OPTS"
+  fi
+
   if [ "x$ENABLE_MONGOD" = "xyes" ]; then
-  exec start-stop-daemon --start --quiet --chuid $DAEMON_USER --exec $DAEMON -- $DAEMON_OPTS
+  exec start-stop-daemon --start --quiet --chuid $DAEMON_USER --exec $NUMACTL $DAEMON $DAEMON_OPTS
   fi
 end script

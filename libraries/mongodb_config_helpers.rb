@@ -9,12 +9,30 @@ module MongoDBConfigHelpers
   # - ensures consistent ordering by key name
   # - does not render entries with a value of nil or ''
   def to_boost_program_options(config)
-    config.sort
-    .map do |key, value|
+    config.sort \
+          .map do |key, value|
       next if value.nil? || value == ''
       "#{key} = #{value}"
+    end \
+          .compact.join("\n")
+  end
+
+  def to_yaml_options(config)
+    config.to_hash.compact.to_yaml
+  end
+end
+
+# Monkey patches Hash to allow us to throw away keys that have empty or nil values
+class Hash
+  def compact
+    inject({}) do |new_hash, (k, v)|
+      if v.is_a?(Hash)
+        v = v.compact
+        new_hash[k] = v unless v.empty?
+      else
+        new_hash[k] = v unless v.nil?
+      end
+      new_hash
     end
-    .compact
-    .join("\n")
   end
 end

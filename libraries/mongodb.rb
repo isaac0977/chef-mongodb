@@ -1,5 +1,5 @@
 #
-# Cookbook Name:: mongodb
+# Cookbook Name:: sc-mongodb
 # Definition:: mongodb
 #
 # Copyright 2011, edelight GmbH
@@ -27,19 +27,14 @@ class Chef::ResourceDefinitionList::MongoDB
     require 'rubygems'
     require 'mongo'
 
-    if members.length == 0
-      if Chef::Config[:solo]
-        Chef::Log.warn('Cannot search for member nodes with chef-solo, defaulting to single node replica set')
-      else
-        Chef::Log.warn("Cannot configure replicaset '#{name}', no member nodes found")
-        return
-      end
+    if members.empty? && Chef::Config[:solo]
+      Chef::Log.warn('Cannot search for member nodes with chef-solo, defaulting to single node replica set')
     end
 
     begin
       connection = nil
       rescue_connection_failure do
-        connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], :op_timeout => 5, :slave_ok => true)
+        connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], op_timeout: 5, slave_ok: true)
         connection.database_names # check connection
       end
     rescue => e
@@ -53,18 +48,22 @@ class Chef::ResourceDefinitionList::MongoDB
     rs_members = []
     rs_options = {}
     members.each_index do |n|
-      host = "#{members[n]['fqdn']}:#{members[n]['mongodb']['config']['port']}"
+      # Ignore any vagrant hosts since we stub all of the nodes in testing
+      next if members[n]['fqdn'] =~ /\.vagrantup\.com$/
+
+      host = "#{members[n]['fqdn']}:#{members[n]['mongodb']['config']['mongod']['net']['port']}"
       rs_options[host] = {}
+
       rs_options[host]['arbiterOnly'] = true if members[n]['mongodb']['replica_arbiter_only']
       rs_options[host]['buildIndexes'] = false unless members[n]['mongodb']['replica_build_indexes']
       rs_options[host]['hidden'] = true if members[n]['mongodb']['replica_hidden']
       slave_delay = members[n]['mongodb']['replica_slave_delay']
       rs_options[host]['slaveDelay'] = slave_delay if slave_delay > 0
-      if rs_options[host]['buildIndexes'] == false || rs_options[host]['hidden'] || rs_options[host]['slaveDelay']
-        priority = 0
-      else
-        priority = members[n]['mongodb']['replica_priority']
-      end
+      priority = if rs_options[host]['buildIndexes'] == false || rs_options[host]['hidden'] || rs_options[host]['slaveDelay']
+                   0
+                 else
+                   members[n]['mongodb']['replica_priority']
+                 end
       rs_options[host]['priority'] = priority unless priority == 1
       tags = members[n]['mongodb']['replica_tags'].to_hash
       rs_options[host]['tags'] = tags unless tags.empty?
@@ -77,6 +76,10 @@ class Chef::ResourceDefinitionList::MongoDB
       "Configuring replicaset with members #{members.map { |n| n['hostname'] }.join(', ')}"
     )
 
+    Chef::Log.debug(
+      "Configuring replicaset with config: #{rs_members}"
+    )
+
     rs_member_ips = []
     members.each_index do |n|
       port = members[n]['mongodb']['config']['port']
@@ -87,28 +90,27 @@ class Chef::ResourceDefinitionList::MongoDB
     cmd = BSON::OrderedHash.new
     cmd['replSetInitiate'] = {
       '_id' => name,
-      'members' => rs_members
+      'members' => node['mongodb']['use_ip_address'] ? rs_member_ips : rs_members,
     }
 
     begin
-      result = admin.command(cmd, :check_response => false)
+      result = admin.command(cmd, check_response: false)
     rescue Mongo::OperationTimeout
       Chef::Log.info('Started configuring the replicaset, this will take some time, another run should run smoothly')
       return
     end
     if result.fetch('ok', nil) == 1
       # everything is fine, do nothing
-    elsif result.fetch('errmsg', nil) =~ /(\S+) is already initiated/ || (result.fetch('errmsg', nil) == 'already initialized')
+    elsif result.fetch('errmsg', nil) =~ /(\S+) is already initiated/ || (result.fetch('errmsg', nil) == 'already initialized') || (result.fetch('errmsg', nil) =~ /is not empty on the initiating member/)
       server, port = Regexp.last_match.nil? || Regexp.last_match.length < 2 ? ['localhost', node['mongodb']['config']['port']] : Regexp.last_match[1].split(':')
       begin
-        connection = Mongo::Connection.new(server, port, :op_timeout => 5, :slave_ok => true)
+        connection = Mongo::Connection.new(server, port, op_timeout: 5, slave_ok: true)
       rescue
         abort("Could not connect to database: '#{server}:#{port}'")
       end
 
       # check if both configs are the same
       config = connection['local']['system']['replset'].find_one('_id' => name)
-
       if config['_id'] == name && config['members'] == rs_members
         # config is up-to-date, do nothing
         Chef::Log.info("Replicaset '#{name}' already configured")
@@ -140,10 +142,10 @@ class Chef::ResourceDefinitionList::MongoDB
         cmd['replSetReconfig'] = config
         result = nil
         begin
-          result = admin.command(cmd, :check_response => false)
+          result = admin.command(cmd, check_response: false)
         rescue Mongo::ConnectionFailure
           # reconfiguring destroys existing connections, reconnect
-          connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], :op_timeout => 5, :slave_ok => true)
+          connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], op_timeout: 5, slave_ok: true)
           config = connection['local']['system']['replset'].find_one('_id' => name)
           # Validate configuration change
           if config['members'] == rs_members
@@ -155,6 +157,7 @@ class Chef::ResourceDefinitionList::MongoDB
         end
         Chef::Log.error("configuring replicaset returned: #{result.inspect}") unless result.fetch('errmsg', nil).nil?
       else
+        Chef::Log.info 'going to add and remove members from the replicaset'
         # remove removed members from the replicaset and add the new ones
         old_ids = config['members'].map { |member| member['_id'] }
         rs_members.map! { |member| member['host'] }
@@ -166,16 +169,29 @@ class Chef::ResourceDefinitionList::MongoDB
           host = m['host']
           { '_id' => m['_id'], 'host' => host }.merge(rs_options[host])
         end
+
         ids = (0...256).to_a - old_ids
+
+        Chef::Log.info "after removing members, config = #{config}"
+        remaining_members = config['members'].count
+
         members_add = rs_members - old_members
         members_add.each do |m|
           new_id = ids.shift
           config['members'] << { '_id' => new_id, 'host' => m }.merge(rs_options[m])
         end
+        Chef::Log.info "after adding new members, config = #{config}"
 
         rs_connection = nil
+        force = false
         rescue_connection_failure do
-          rs_connection = Mongo::ReplSetConnection.new(old_members)
+          case remaining_members
+          when 0
+            force = true
+            rs_connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], op_timeout: 5, slave_ok: true)
+          else
+            rs_connection = Mongo::ReplSetConnection.new(old_members)
+          end
           rs_connection.database_names # check connection
         end
 
@@ -186,10 +202,10 @@ class Chef::ResourceDefinitionList::MongoDB
 
         result = nil
         begin
-          result = admin.command(cmd, :check_response => false)
+          result = admin.command(cmd, force: force, check_response: false)
         rescue Mongo::ConnectionFailure
           # reconfiguring destroys existing connections, reconnect
-          connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], :op_timeout => 5, :slave_ok => true)
+          connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], op_timeout: 5, slave_ok: true)
           config = connection['local']['system']['replset'].find_one('_id' => name)
           # Validate configuration change
           if config['members'] == rs_members
@@ -214,15 +230,15 @@ class Chef::ResourceDefinitionList::MongoDB
     shard_groups = Hash.new { |h, k| h[k] = [] }
 
     shard_nodes.each do |n|
-      if n['recipes'].include?('mongodb::replicaset')
+      if n['recipes'].include?('sc-mongodb::replicaset')
         # do not include hidden members when calling addShard
         # see https://jira.mongodb.org/browse/SERVER-9882
         next if n['mongodb']['replica_hidden']
-        key = "rs_#{n['mongodb']['shard_name']}"
+        key = n['mongodb']['config']['mongod']['replication']['replSetName'] || "rs_#{n['mongodb']['shard_name']}"
       else
         key = '_single'
       end
-      shard_groups[key] << "#{n['fqdn']}:#{n['mongodb']['config']['port']}"
+      shard_groups[key] << "#{n['fqdn']}:#{n['mongodb']['config']['mongod']['net']['port']}"
     end
     Chef::Log.info(shard_groups.inspect)
 
@@ -236,24 +252,45 @@ class Chef::ResourceDefinitionList::MongoDB
     end
     Chef::Log.info(shard_members.inspect)
 
+    mongo_port = node['mongodb']['config']['mongos']['net']['port']
+
     begin
-      connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], :op_timeout => 5)
+      connection = nil
+      rescue_connection_failure do
+        connection = Mongo::Connection.new('localhost', mongo_port, op_timeout: 5)
+      end
     rescue => e
-      Chef::Log.warn("Could not connect to database: 'localhost:#{node['mongodb']['config']['port']}', reason #{e}")
+      Chef::Log.warn("Could not connect to database: 'localhost:#{mongo_port}', reason #{e}")
       return
     end
 
     admin = connection['admin']
 
+    # If we require authentication on mongos / mongod, need to authenticate to run these commands
+    if node.recipe?('sc-mongodb::user_management')
+      begin
+        admin.authenticate(node['mongodb']['authentication']['username'], node['mongodb']['authentication']['password'])
+      rescue Mongo::AuthenticationError => e
+        Chef::Log.warn("Unable to authenticate with database to add shards to mongos node: #{e}")
+      end
+    end
+
     shard_members.each do |shard|
       cmd = BSON::OrderedHash.new
       cmd['addShard'] = shard
+      require 'pry'
+      # binding.pry
       begin
-        result = admin.command(cmd, :check_response => false)
+        result = admin.command(cmd, check_response: false)
       rescue Mongo::OperationTimeout
         result = "Adding shard '#{shard}' timed out, run the recipe again to check the result"
       end
-      Chef::Log.info(result.inspect)
+
+      if result['ok'] == 0.0
+        Chef::Log.error(result.inspect)
+      else
+        Chef::Log.info(result.inspect)
+      end
     end
   end
 
@@ -267,14 +304,28 @@ class Chef::ResourceDefinitionList::MongoDB
     require 'rubygems'
     require 'mongo'
 
+    mongo_port = node['mongodb']['config']['mongos']['net']['port']
+
     begin
-      connection = Mongo::Connection.new('localhost', node['mongodb']['config']['port'], :op_timeout => 5)
+      connection = nil
+      rescue_connection_failure do
+        connection = Mongo::Connection.new('localhost', mongo_port, op_timeout: 5)
+      end
     rescue => e
-      Chef::Log.warn("Could not connect to database: 'localhost:#{node['mongodb']['config']['port']}', reason #{e}")
+      Chef::Log.warn("Could not connect to database: 'localhost:#{mongo_port}', reason #{e}")
       return
     end
 
     admin = connection['admin']
+
+    # If we require authentication on mongos / mongod, need to authenticate to run these commands
+    if node.recipe?('sc-mongodb::user_management')
+      begin
+        admin.authenticate(node['mongodb']['authentication']['username'], node['mongodb']['authentication']['password'])
+      rescue Mongo::AuthenticationError => e
+        Chef::Log.warn("Unable to authenticate with database to configure databased on mongos node: #{e}")
+      end
+    end
 
     databases = sharded_collections.keys.map { |x| x.split('.').first }.uniq
     Chef::Log.info("enable sharding for these databases: '#{databases.inspect}'")
@@ -283,7 +334,7 @@ class Chef::ResourceDefinitionList::MongoDB
       cmd = BSON::OrderedHash.new
       cmd['enablesharding'] = db_name
       begin
-        result = admin.command(cmd, :check_response => false)
+        result = admin.command(cmd, check_response: false)
       rescue Mongo::OperationTimeout
         result = "enable sharding for '#{db_name}' timed out, run the recipe again to check the result"
       end
@@ -306,7 +357,7 @@ class Chef::ResourceDefinitionList::MongoDB
       cmd['shardcollection'] = name
       cmd['key'] = { key => 1 }
       begin
-        result = admin.command(cmd, :check_response => false)
+        result = admin.command(cmd, check_response: false)
       rescue Mongo::OperationTimeout
         result = "sharding '#{name}' on key '#{key}' timed out, run the recipe again to check the result"
       end
